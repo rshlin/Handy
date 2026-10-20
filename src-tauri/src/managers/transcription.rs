@@ -37,6 +37,7 @@ use transcribe_rs::{
     SpeechModel, TranscribeOptions,
 };
 
+mod remote_whisper; // fork: rshlin/remote-whisper
 const STREAM_PERF_LOG_INTERVAL: Duration = Duration::from_secs(5);
 const STREAM_FINALIZE_REPLY_TIMEOUT: Duration = Duration::from_secs(30);
 
@@ -743,6 +744,7 @@ impl TranscriptionManager {
 
     /// Kicks off the model loading in a background thread if it's not already loaded
     pub fn initiate_model_load(&self) {
+        remote_whisper::preload_hook! { self } // fork: rshlin/remote-whisper
         let mut is_loading = self.is_loading.lock().unwrap();
         if *is_loading {
             return;
@@ -1201,6 +1203,7 @@ impl TranscriptionManager {
             self.maybe_unload_immediately("empty audio");
             return Ok(String::new());
         }
+        remote_whisper::transcribe_hook! { self, audio } // fork: rshlin/remote-whisper
 
         // Check if model is loaded, if not try to load it
         {
