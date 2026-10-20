@@ -39,7 +39,8 @@ The hooks are brace-delimited macros because rustfmt leaves `name! { .. }` untou
 `if .. { return; }` would be split over three lines by `cargo fmt`. They expand to:
 
 - `preload_hook!`: `if skips_local_preload(tm) { return; }` — when the server is configured and
-  `GET /` answers 200 within 1 s, recording starts without loading the local model.
+  `GET /` answers 200 within 1 s, recording starts without loading the local model, and a local
+  model loaded by another path (Handy loads the selected model at startup) is unloaded if idle.
 - `transcribe_hook!`: `if let Some(text) = transcribe(tm, &audio) { return Ok(text); }`.
 
 `remote_whisper::transcribe`:
@@ -51,7 +52,12 @@ The hooks are brace-delimited macros because rustfmt leaves `name! { .. }` untou
    language, `auto` when Handy says auto.
 3. Runs Handy's own `post_process_transcription_text` on the reply (Chinese script conversion,
    filler-word removal, normalisation; custom-word fuzzy correction is skipped when the words went
-   in as the prompt, as Handy does for its local whisper models), logs, and returns it.
+   in as the prompt, as Handy does for its local whisper models), logs, and returns it. After a
+   successful remote run an idle local engine is unloaded: every `transcribe()` resets Handy's
+   idle-unload timer, so the timer alone would keep it resident while the server does the work.
+   "Idle" means no load in flight, not leased to a live-preview stream and not taken out by a
+   local transcription; the unload goes through upstream's `unload_model()`, so the UI gets the
+   usual `model-state-changed` event.
 4. On any error (server down, timeout, non-200, bad JSON) it logs a warning, loads the selected
    local model if preload was skipped, and returns `None`, so Handy's normal local path runs.
    Dictation never fails because the server is down.
@@ -107,7 +113,8 @@ scripts/fork/build.sh
 
 `bun install`, then `bun run tauri build --target aarch64-apple-darwin --bundles app` with
 updater artifacts disabled (they need upstream's signing key), re-signs the `.app` with the local
-identity, quits a running Handy, replaces `/Applications/Handy.app` and prints the version.
+identity, copies it next to `/Applications/Handy.app`, quits a running Handy, swaps the new app
+in, prints the version and signature, and relaunches Handy if it was running.
 `HANDY_SIGN_IDENTITY` overrides the identity name.
 
 ## Signing

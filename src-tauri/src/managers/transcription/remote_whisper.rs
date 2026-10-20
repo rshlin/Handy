@@ -16,6 +16,7 @@ use log::{info, warn};
 use serde::Deserialize;
 use std::io::Cursor;
 use std::path::Path;
+use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
 const CONFIG_FILE: &str = "remote-whisper.json";
@@ -66,27 +67,91 @@ macro_rules! transcribe_hook {
 }
 pub(super) use transcribe_hook;
 
+/// The local engine, as far as remote transcription needs it. A trait so the
+/// hook logic can be tested without a running app.
+trait LocalModel {
+    /// Unload the local engine if it is loaded and idle: no load in flight, not
+    /// leased to a live-preview stream, not taken out by a local transcription.
+    /// Returns true if it unloaded.
+    fn release_if_idle(&self) -> bool;
+    /// Load the selected model if nothing is loaded (the fallback path).
+    fn ensure_loaded(&self);
+}
+
+impl LocalModel for TranscriptionManager {
+    fn release_if_idle(&self) -> bool {
+        // Holding the loading flag's mutex keeps a load from starting while
+        // we unload; same lock order (is_loading, then engine) as transcribe().
+        let is_loading = self.is_loading.lock().unwrap();
+        if *is_loading
+            || self.active_stream_worker.load(Ordering::Acquire) != 0
+            || self.active_engine_lease.load(Ordering::Acquire) != 0
+            || self.lock_engine().is_none()
+        {
+            return false;
+        }
+        info!("Remote whisper is serving; unloading the local model");
+        let unloaded = match self.unload_model() {
+            Ok(()) => true,
+            Err(e) => {
+                warn!("Failed to unload the local model: {}", e);
+                false
+            }
+        };
+        drop(is_loading);
+        unloaded
+    }
+
+    /// Wait for any load in flight, then load the selected model if nothing
+    /// is loaded (preload was skipped or the engine was released).
+    fn ensure_loaded(&self) {
+        {
+            let mut is_loading = self.is_loading.lock().unwrap();
+            while *is_loading {
+                is_loading = self.loading_condvar.wait(is_loading).unwrap();
+            }
+        }
+        if self.is_model_loaded() {
+            return;
+        }
+        // A load that starts between the wait and here holds the flag; the local
+        // path waits for it, so only load when we own the flag.
+        let model_id = get_settings(&self.app_handle).selected_model;
+        if let Some(_guard) = self.try_start_loading() {
+            if let Err(e) = self.load_model(&model_id) {
+                warn!("Local fallback could not load model '{}': {}", model_id, e);
+            }
+        }
+    }
+}
+
 /// Hook for `TranscriptionManager::initiate_model_load`: true when the remote
 /// server is configured and healthy, so the local model is not preloaded.
 pub(super) fn skips_local_preload(tm: &TranscriptionManager) -> bool {
-    match config(tm) {
-        Some(cfg) => {
-            let healthy = health(&cfg);
-            if !healthy {
-                warn!(
-                    "Remote whisper at {} is not healthy; preloading the local model",
-                    cfg.url
-                );
-            }
-            healthy
-        }
-        None => false,
+    preload_decision(tm, config(tm).as_ref())
+}
+
+/// With a healthy server, skip the preload and release a model loaded by
+/// another path (Handy loads the selected model at startup, for example), so
+/// it does not stay resident while the server does the work.
+fn preload_decision(local: &impl LocalModel, cfg: Option<&Config>) -> bool {
+    let Some(cfg) = cfg else {
+        return false;
+    };
+    if !health(cfg) {
+        warn!(
+            "Remote whisper at {} is not healthy; preloading the local model",
+            cfg.url
+        );
+        return false;
     }
+    local.release_if_idle();
+    true
 }
 
 /// Hook for `TranscriptionManager::transcribe`: the post-processed remote text,
 /// or `None` to let Handy's local path run (feature off, or the server failed —
-/// in which case the local model is loaded here first if preload was skipped).
+/// in which case the local model is loaded here first if it is not loaded).
 pub(super) fn transcribe(tm: &TranscriptionManager, audio: &[f32]) -> Option<String> {
     let cfg = config(tm)?;
     let settings = get_settings(&tm.app_handle);
@@ -97,17 +162,7 @@ pub(super) fn transcribe(tm: &TranscriptionManager, audio: &[f32]) -> Option<Str
     };
 
     let started = Instant::now();
-    let raw = match transcribe_remote(&cfg, audio, &request) {
-        Ok(text) => text,
-        Err(e) => {
-            warn!(
-                "Remote whisper failed ({}); falling back to the local model",
-                e
-            );
-            ensure_local_model(tm, &settings.selected_model);
-            return None;
-        }
-    };
+    let raw = remote_or_fallback(tm, &cfg, audio, &request)?;
 
     let hint = (request.language != "auto").then_some(request.language.as_str());
     let output_language = resolve_output_language_evidence(&settings, hint, &[], request.translate);
@@ -125,8 +180,33 @@ pub(super) fn transcribe(tm: &TranscriptionManager, audio: &[f32]) -> Option<Str
         cfg.url,
         crate::utils::redact_text(&text)
     );
-    tm.maybe_unload_immediately("transcription");
     Some(text)
+}
+
+/// The raw remote text, releasing an idle local engine on success (each
+/// transcribe() resets Handy's idle-unload timer, so the timer alone would
+/// never free it); on failure, make sure the local model is loaded and return
+/// `None`.
+fn remote_or_fallback(
+    local: &impl LocalModel,
+    cfg: &Config,
+    audio: &[f32],
+    request: &Request,
+) -> Option<String> {
+    match transcribe_remote(cfg, audio, request) {
+        Ok(text) => {
+            local.release_if_idle();
+            Some(text)
+        }
+        Err(e) => {
+            warn!(
+                "Remote whisper failed ({}); falling back to the local model",
+                e
+            );
+            local.ensure_loaded();
+            None
+        }
+    }
 }
 
 fn config(tm: &TranscriptionManager) -> Option<Config> {
@@ -134,27 +214,6 @@ fn config(tm: &TranscriptionManager) -> Option<Config> {
         .ok()
         .map(|dir| dir.join(CONFIG_FILE));
     read_config(file.as_deref(), std::env::var(URL_ENV).ok().as_deref())
-}
-
-/// The local fallback after a remote failure: wait for any load in flight,
-/// then load the selected model if nothing is loaded (preload was skipped).
-fn ensure_local_model(tm: &TranscriptionManager, model_id: &str) {
-    {
-        let mut is_loading = tm.is_loading.lock().unwrap();
-        while *is_loading {
-            is_loading = tm.loading_condvar.wait(is_loading).unwrap();
-        }
-    }
-    if tm.is_model_loaded() {
-        return;
-    }
-    // A load that starts between the wait and here holds the flag; the local
-    // path waits for it, so only load when we own the flag.
-    if let Some(_guard) = tm.try_start_loading() {
-        if let Err(e) = tm.load_model(model_id) {
-            warn!("Local fallback could not load model '{}': {}", model_id, e);
-        }
-    }
 }
 
 fn read_config(path: Option<&Path>, env_url: Option<&str>) -> Option<Config> {
@@ -586,6 +645,130 @@ mod tests {
         let (url, _rx) = fake_server("503 Service Unavailable", "loading", Duration::ZERO);
         assert!(!health(&cfg(url, DEFAULT_TIMEOUT)));
         assert!(!health(&cfg(dead_url(), DEFAULT_TIMEOUT)));
+    }
+
+    /// A fake local engine: `loaded` plus counters for what the hooks asked.
+    #[derive(Default)]
+    struct FakeLocal {
+        loaded: std::sync::atomic::AtomicBool,
+        busy: bool,
+        releases: std::sync::atomic::AtomicUsize,
+        loads: std::sync::atomic::AtomicUsize,
+    }
+
+    impl FakeLocal {
+        fn loaded(busy: bool) -> Self {
+            let fake = FakeLocal {
+                busy,
+                ..Default::default()
+            };
+            fake.loaded.store(true, Ordering::SeqCst);
+            fake
+        }
+        fn is_loaded(&self) -> bool {
+            self.loaded.load(Ordering::SeqCst)
+        }
+        fn releases(&self) -> usize {
+            self.releases.load(Ordering::SeqCst)
+        }
+        fn loads(&self) -> usize {
+            self.loads.load(Ordering::SeqCst)
+        }
+    }
+
+    impl LocalModel for FakeLocal {
+        fn release_if_idle(&self) -> bool {
+            if self.busy || !self.is_loaded() {
+                return false;
+            }
+            self.loaded.store(false, Ordering::SeqCst);
+            self.releases.fetch_add(1, Ordering::SeqCst);
+            true
+        }
+        fn ensure_loaded(&self) {
+            if !self.is_loaded() {
+                self.loaded.store(true, Ordering::SeqCst);
+                self.loads.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+    }
+
+    #[test]
+    fn healthy_server_skips_preload_and_unloads_a_loaded_model() {
+        let (url, _rx) = fake_server("200 OK", "ok", Duration::ZERO);
+        let local = FakeLocal::loaded(false);
+        assert!(preload_decision(&local, Some(&cfg(url, DEFAULT_TIMEOUT))));
+        assert!(!local.is_loaded());
+        assert_eq!(local.releases(), 1);
+    }
+
+    #[test]
+    fn healthy_server_with_nothing_loaded_is_a_no_op() {
+        let (url, _rx) = fake_server("200 OK", "ok", Duration::ZERO);
+        let local = FakeLocal::default();
+        assert!(preload_decision(&local, Some(&cfg(url, DEFAULT_TIMEOUT))));
+        assert_eq!(local.releases(), 0);
+        assert_eq!(local.loads(), 0);
+    }
+
+    #[test]
+    fn busy_local_engine_is_not_unloaded() {
+        let (url, _rx) = fake_server("200 OK", "ok", Duration::ZERO);
+        let local = FakeLocal::loaded(true);
+        assert!(preload_decision(&local, Some(&cfg(url, DEFAULT_TIMEOUT))));
+        assert!(local.is_loaded());
+    }
+
+    #[test]
+    fn server_down_preloads_and_keeps_the_local_model() {
+        let local = FakeLocal::loaded(false);
+        assert!(!preload_decision(
+            &local,
+            Some(&cfg(dead_url(), DEFAULT_TIMEOUT))
+        ));
+        assert!(local.is_loaded());
+        assert_eq!(local.releases(), 0);
+        assert!(!preload_decision(&local, None));
+        assert!(local.is_loaded());
+    }
+
+    #[test]
+    fn remote_success_unloads_the_local_model() {
+        let (url, _rx) = fake_server("200 OK", r#"{"text": " hi "}"#, Duration::ZERO);
+        let local = FakeLocal::loaded(false);
+        let text = remote_or_fallback(
+            &local,
+            &cfg(url, Duration::from_secs(5)),
+            &[0.0; 160],
+            &request(),
+        );
+        assert_eq!(text.as_deref(), Some("hi"));
+        assert!(!local.is_loaded());
+        assert_eq!(local.loads(), 0);
+    }
+
+    #[test]
+    fn remote_failure_after_unload_loads_the_local_model_again() {
+        let (url, _rx) = fake_server("200 OK", r#"{"text": "hi"}"#, Duration::ZERO);
+        let local = FakeLocal::loaded(false);
+        remote_or_fallback(
+            &local,
+            &cfg(url, Duration::from_secs(5)),
+            &[0.0; 160],
+            &request(),
+        );
+        assert!(!local.is_loaded());
+
+        let text = remote_or_fallback(
+            &local,
+            &cfg(dead_url(), Duration::from_secs(5)),
+            &[0.0; 160],
+            &request(),
+        );
+        assert_eq!(text, None);
+        assert!(local.is_loaded());
+        assert_eq!(local.loads(), 1);
+        assert_eq!(local.releases(), 1);
     }
 
     #[test]

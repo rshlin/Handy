@@ -32,14 +32,28 @@ codesign --force --deep --options runtime --timestamp=none \
   -s "$IDENTITY" "$app"
 codesign --verify --deep --strict "$app"
 
+# Copy next to the destination first, so a failed copy leaves the old app.
+staged="$(dirname "$DEST")/.Handy.app.new"
+old="$(dirname "$DEST")/.Handy.app.old"
+rm -rf "$staged" "$old"
+ditto "$app" "$staged"
+
+was_running=false
 if pgrep -x handy >/dev/null; then
+  was_running=true
   echo "Quitting the running Handy"
   osascript -e 'quit app "Handy"' || true
-  sleep 2
+  for _ in $(seq 1 20); do pgrep -x handy >/dev/null || break; sleep 0.5; done
 fi
-rm -rf "$DEST"
-ditto "$app" "$DEST"
+[ -d "$DEST" ] && mv "$DEST" "$old"
+mv "$staged" "$DEST"
+rm -rf "$old"
 
-codesign -dv "$DEST" 2>&1 | grep -E '^(Identifier|Authority|TeamIdentifier)='
+codesign -dvv "$DEST" 2>&1 | grep -E '^(Identifier|Authority|TeamIdentifier)='
 codesign -d -r- "$DEST" 2>&1 | grep '^designated'
 echo "Installed $DEST $(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$DEST/Contents/Info.plist") ($(git rev-parse --short HEAD))"
+
+if $was_running; then
+  echo "Relaunching Handy"
+  open -a "$DEST"
+fi
