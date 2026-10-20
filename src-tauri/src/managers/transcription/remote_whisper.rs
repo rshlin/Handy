@@ -8,16 +8,19 @@
 //! upstream files only carry the `mod` line and two hook calls (see FORK.md).
 
 use super::{
-    post_process_transcription_text, resolve_output_language_evidence, TranscriptionManager,
+    post_process_transcription_text, resolve_output_language_evidence, ModelStateEvent,
+    TranscriptionManager,
 };
 use crate::settings::get_settings;
 use anyhow::{anyhow, Result};
 use log::{info, warn};
 use serde::Deserialize;
+use std::cell::Cell;
 use std::io::Cursor;
 use std::path::Path;
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
+use tauri::Emitter;
 
 const CONFIG_FILE: &str = "remote-whisper.json";
 const URL_ENV: &str = "HANDY_REMOTE_WHISPER_URL";
@@ -47,15 +50,15 @@ struct Request {
 // The hooks are brace-delimited macros so each stays one line in upstream
 // files: rustfmt leaves `name! { .. }` alone but would split an `if` block.
 
-/// `initiate_model_load` hook: return before preloading the local model.
-macro_rules! preload_hook {
-    ($tm:expr) => {
-        if remote_whisper::skips_local_preload($tm) {
-            return;
+/// `load_model_with_device` hook: return before loading the local model.
+macro_rules! load_hook {
+    ($tm:expr, $model_id:expr) => {
+        if remote_whisper::skips_local_load($tm, $model_id) {
+            return Ok(());
         }
     };
 }
-pub(super) use preload_hook;
+pub(super) use load_hook;
 
 /// `transcribe` hook: return the remote text, or carry on with the local path.
 macro_rules! transcribe_hook {
@@ -76,6 +79,9 @@ trait LocalModel {
     fn release_if_idle(&self) -> bool;
     /// Load the selected model if nothing is loaded (the fallback path).
     fn ensure_loaded(&self);
+    /// A load of `model_id` was skipped: drop the engine the load would have
+    /// replaced and tell the UI the selection changed.
+    fn stand_down(&self, model_id: &str);
 }
 
 impl LocalModel for TranscriptionManager {
@@ -118,34 +124,79 @@ impl LocalModel for TranscriptionManager {
         // path waits for it, so only load when we own the flag.
         let model_id = get_settings(&self.app_handle).selected_model;
         if let Some(_guard) = self.try_start_loading() {
-            if let Err(e) = self.load_model(&model_id) {
+            if let Err(e) = fallback_load(|| self.load_model(&model_id)) {
                 warn!("Local fallback could not load model '{}': {}", model_id, e);
             }
         }
     }
+
+    fn stand_down(&self, model_id: &str) {
+        // load_model_with_device drops the current engine before building the
+        // new one; do the same so a switched-away model does not stay resident.
+        if self.active_engine_lease.load(Ordering::Acquire) == 0 && self.lock_engine().is_some() {
+            if let Err(e) = self.unload_model() {
+                warn!("Failed to unload the local model: {}", e);
+            }
+        }
+        // Same event upstream emits when it skips eager loading (unload set to
+        // "Immediately"): the UI shows the model as selected, the tray refreshes.
+        let _ = self.app_handle.emit(
+            "model-state-changed",
+            ModelStateEvent {
+                event_type: "selection_changed".to_string(),
+                model_id: Some(model_id.to_string()),
+                model_name: self.model_manager.get_model_info(model_id).map(|m| m.name),
+                error: None,
+            },
+        );
+    }
 }
 
-/// Hook for `TranscriptionManager::initiate_model_load`: true when the remote
-/// server is configured and healthy, so the local model is not preloaded.
-pub(super) fn skips_local_preload(tm: &TranscriptionManager) -> bool {
-    preload_decision(tm, config(tm).as_ref())
+thread_local! {
+    /// Set while the fork's own fallback loads the local model, so the load
+    /// hook lets that load through even if the server answers health checks.
+    static FALLBACK_LOAD: Cell<bool> = const { Cell::new(false) };
 }
 
-/// With a healthy server, skip the preload and release a model loaded by
-/// another path (Handy loads the selected model at startup, for example), so
-/// it does not stay resident while the server does the work.
-fn preload_decision(local: &impl LocalModel, cfg: Option<&Config>) -> bool {
+/// Runs `load` with the load hook bypassed on this thread.
+fn fallback_load<T>(load: impl FnOnce() -> T) -> T {
+    struct Reset(bool);
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            FALLBACK_LOAD.with(|f| f.set(self.0));
+        }
+    }
+    let _reset = Reset(FALLBACK_LOAD.with(|f| f.replace(true)));
+    load()
+}
+
+/// Hook for `TranscriptionManager::load_model_with_device`: true when the
+/// remote server is configured and healthy, so the local model is not loaded.
+/// Every local load goes through there (startup and model selection, the
+/// recording-start preload, the CLI), so nothing loads while the server is up.
+pub(super) fn skips_local_load(tm: &TranscriptionManager, model_id: &str) -> bool {
+    load_decision(tm, config(tm).as_ref(), model_id)
+}
+
+fn load_decision(local: &impl LocalModel, cfg: Option<&Config>, model_id: &str) -> bool {
+    if FALLBACK_LOAD.with(Cell::get) {
+        return false;
+    }
     let Some(cfg) = cfg else {
         return false;
     };
     if !health(cfg) {
         warn!(
-            "Remote whisper at {} is not healthy; preloading the local model",
-            cfg.url
+            "Remote whisper at {} is not healthy; loading the local model '{}'",
+            cfg.url, model_id
         );
         return false;
     }
-    local.release_if_idle();
+    info!(
+        "Remote whisper at {} is healthy; not loading the local model '{}'",
+        cfg.url, model_id
+    );
+    local.stand_down(model_id);
     true
 }
 
@@ -647,13 +698,16 @@ mod tests {
         assert!(!health(&cfg(dead_url(), DEFAULT_TIMEOUT)));
     }
 
-    /// A fake local engine: `loaded` plus counters for what the hooks asked.
+    /// A fake local engine. Like the real one, its `ensure_loaded` loads
+    /// through the load hook (`load_decision`) with the fallback bypass set.
     #[derive(Default)]
     struct FakeLocal {
         loaded: std::sync::atomic::AtomicBool,
         busy: bool,
+        hook_cfg: Option<Config>,
         releases: std::sync::atomic::AtomicUsize,
         loads: std::sync::atomic::AtomicUsize,
+        stand_downs: std::sync::atomic::AtomicUsize,
     }
 
     impl FakeLocal {
@@ -668,11 +722,15 @@ mod tests {
         fn is_loaded(&self) -> bool {
             self.loaded.load(Ordering::SeqCst)
         }
-        fn releases(&self) -> usize {
-            self.releases.load(Ordering::SeqCst)
+        fn count(counter: &std::sync::atomic::AtomicUsize) -> usize {
+            counter.load(Ordering::SeqCst)
         }
-        fn loads(&self) -> usize {
-            self.loads.load(Ordering::SeqCst)
+        /// What `load_model_with_device` does: the hook, then the load.
+        fn load(&self, model_id: &str) {
+            if !load_decision(self, self.hook_cfg.as_ref(), model_id) {
+                self.loaded.store(true, Ordering::SeqCst);
+                self.loads.fetch_add(1, Ordering::SeqCst);
+            }
         }
     }
 
@@ -687,53 +745,66 @@ mod tests {
         }
         fn ensure_loaded(&self) {
             if !self.is_loaded() {
-                self.loaded.store(true, Ordering::SeqCst);
-                self.loads.fetch_add(1, Ordering::SeqCst);
+                fallback_load(|| self.load("m"));
             }
+        }
+        fn stand_down(&self, _model_id: &str) {
+            self.loaded.store(false, Ordering::SeqCst);
+            self.stand_downs.fetch_add(1, Ordering::SeqCst);
         }
     }
 
     #[test]
-    fn healthy_server_skips_preload_and_unloads_a_loaded_model() {
+    fn healthy_server_skips_the_local_load() {
         let (url, _rx) = fake_server("200 OK", "ok", Duration::ZERO);
-        let local = FakeLocal::loaded(false);
-        assert!(preload_decision(&local, Some(&cfg(url, DEFAULT_TIMEOUT))));
+        let local = FakeLocal {
+            hook_cfg: Some(cfg(url, DEFAULT_TIMEOUT)),
+            ..Default::default()
+        };
+        local.load("turbo");
         assert!(!local.is_loaded());
-        assert_eq!(local.releases(), 1);
+        assert_eq!(FakeLocal::count(&local.loads), 0);
+        assert_eq!(FakeLocal::count(&local.stand_downs), 1);
     }
 
     #[test]
-    fn healthy_server_with_nothing_loaded_is_a_no_op() {
-        let (url, _rx) = fake_server("200 OK", "ok", Duration::ZERO);
+    fn server_down_or_feature_off_loads_locally() {
+        let local = FakeLocal {
+            hook_cfg: Some(cfg(dead_url(), DEFAULT_TIMEOUT)),
+            ..Default::default()
+        };
+        local.load("turbo");
+        assert!(local.is_loaded());
+        assert_eq!(FakeLocal::count(&local.stand_downs), 0);
+
         let local = FakeLocal::default();
-        assert!(preload_decision(&local, Some(&cfg(url, DEFAULT_TIMEOUT))));
-        assert_eq!(local.releases(), 0);
-        assert_eq!(local.loads(), 0);
+        local.load("turbo");
+        assert!(local.is_loaded());
     }
 
     #[test]
-    fn busy_local_engine_is_not_unloaded() {
+    fn fallback_load_bypasses_the_hook_and_resets_after() {
         let (url, _rx) = fake_server("200 OK", "ok", Duration::ZERO);
-        let local = FakeLocal::loaded(true);
-        assert!(preload_decision(&local, Some(&cfg(url, DEFAULT_TIMEOUT))));
-        assert!(local.is_loaded());
-    }
-
-    #[test]
-    fn server_down_preloads_and_keeps_the_local_model() {
-        let local = FakeLocal::loaded(false);
-        assert!(!preload_decision(
+        let healthy = cfg(url, DEFAULT_TIMEOUT);
+        let local = FakeLocal::default();
+        assert!(!fallback_load(|| load_decision(
             &local,
-            Some(&cfg(dead_url(), DEFAULT_TIMEOUT))
-        ));
-        assert!(local.is_loaded());
-        assert_eq!(local.releases(), 0);
-        assert!(!preload_decision(&local, None));
-        assert!(local.is_loaded());
+            Some(&healthy),
+            "m"
+        )));
+        assert_eq!(FakeLocal::count(&local.stand_downs), 0);
+        assert!(!FALLBACK_LOAD.with(Cell::get));
+        // The bypass is per thread: another thread is not affected.
+        fallback_load(|| {
+            let other = thread::spawn(|| FALLBACK_LOAD.with(Cell::get))
+                .join()
+                .unwrap();
+            assert!(!other);
+        });
     }
 
     #[test]
-    fn remote_success_unloads_the_local_model() {
+    fn remote_success_unloads_an_idle_local_model() {
         let (url, _rx) = fake_server("200 OK", r#"{"text": " hi "}"#, Duration::ZERO);
         let local = FakeLocal::loaded(false);
         let text = remote_or_fallback(
@@ -744,31 +815,43 @@ mod tests {
         );
         assert_eq!(text.as_deref(), Some("hi"));
         assert!(!local.is_loaded());
-        assert_eq!(local.loads(), 0);
+        assert_eq!(FakeLocal::count(&local.loads), 0);
     }
 
     #[test]
-    fn remote_failure_after_unload_loads_the_local_model_again() {
+    fn remote_success_keeps_a_busy_local_model() {
         let (url, _rx) = fake_server("200 OK", r#"{"text": "hi"}"#, Duration::ZERO);
-        let local = FakeLocal::loaded(false);
+        let local = FakeLocal::loaded(true);
         remote_or_fallback(
             &local,
             &cfg(url, Duration::from_secs(5)),
             &[0.0; 160],
             &request(),
         );
-        assert!(!local.is_loaded());
+        assert!(local.is_loaded());
+    }
 
+    #[test]
+    fn remote_failure_loads_locally_even_while_health_checks_pass() {
+        // The inference request fails, but the hook's health check would
+        // still pass (e.g. the server errors on this one job): the fallback
+        // must load anyway.
+        let (health_url, _rx) = fake_server("200 OK", "ok", Duration::ZERO);
+        let local = FakeLocal {
+            hook_cfg: Some(cfg(health_url, DEFAULT_TIMEOUT)),
+            ..Default::default()
+        };
+        let (url, _rx) = fake_server("500 Internal Server Error", "{}", Duration::ZERO);
         let text = remote_or_fallback(
             &local,
-            &cfg(dead_url(), Duration::from_secs(5)),
+            &cfg(url, Duration::from_secs(5)),
             &[0.0; 160],
             &request(),
         );
         assert_eq!(text, None);
         assert!(local.is_loaded());
-        assert_eq!(local.loads(), 1);
-        assert_eq!(local.releases(), 1);
+        assert_eq!(FakeLocal::count(&local.loads), 1);
+        assert_eq!(FakeLocal::count(&local.stand_downs), 0);
     }
 
     #[test]

@@ -484,6 +484,7 @@ impl TranscriptionManager {
         model_id: &str,
         device_index: Option<usize>,
     ) -> Result<()> {
+        remote_whisper::load_hook! { self, model_id } // fork: rshlin/remote-whisper
         apply_accelerator_settings(&self.app_handle);
 
         let load_start = std::time::Instant::now();
@@ -744,7 +745,6 @@ impl TranscriptionManager {
 
     /// Kicks off the model loading in a background thread if it's not already loaded
     pub fn initiate_model_load(&self) {
-        remote_whisper::preload_hook! { self } // fork: rshlin/remote-whisper
         let mut is_loading = self.is_loading.lock().unwrap();
         if *is_loading {
             return;

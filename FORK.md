@@ -24,10 +24,10 @@ mod remote_whisper; // fork: rshlin/remote-whisper
 before `const STREAM_PERF_LOG_INTERVAL`;
 
 ```rust
-        remote_whisper::preload_hook! { self } // fork: rshlin/remote-whisper
+        remote_whisper::load_hook! { self, model_id } // fork: rshlin/remote-whisper
 ```
 
-as the first line of `TranscriptionManager::initiate_model_load()`;
+as the first line of `TranscriptionManager::load_model_with_device()`;
 
 ```rust
         remote_whisper::transcribe_hook! { self, audio } // fork: rshlin/remote-whisper
@@ -38,9 +38,15 @@ in `TranscriptionManager::transcribe()`, right after the `if audio.is_empty() { 
 The hooks are brace-delimited macros because rustfmt leaves `name! { .. }` untouched; a plain
 `if .. { return; }` would be split over three lines by `cargo fmt`. They expand to:
 
-- `preload_hook!`: `if skips_local_preload(tm) { return; }` — when the server is configured and
-  `GET /` answers 200 within 1 s, recording starts without loading the local model, and a local
-  model loaded by another path (Handy loads the selected model at startup) is unloaded if idle.
+- `load_hook!`: `if skips_local_load(tm, model_id) { return Ok(()); }` — when the server is
+  configured and `GET /` answers 200 within 1 s, the local model is not loaded. Every local load
+  goes through `load_model_with_device` (model selection and onboarding, the recording-start
+  preload, `--transcribe-file`), so nothing loads while the server is up. On a skip the module
+  drops the engine the load would have replaced (as the real load does first) and emits the
+  `selection_changed` event upstream itself emits when it skips eager loading, so the UI shows
+  the selected model (as "unloaded", like after an idle unload) and the tray refreshes; no
+  `loading_started` is emitted, so nothing is left in a loading state. The fork's own fallback
+  load sets a thread-local bypass flag and always goes through.
 - `transcribe_hook!`: `if let Some(text) = transcribe(tm, &audio) { return Ok(text); }`.
 
 `remote_whisper::transcribe`:
@@ -59,12 +65,13 @@ The hooks are brace-delimited macros because rustfmt leaves `name! { .. }` untou
    local transcription; the unload goes through upstream's `unload_model()`, so the UI gets the
    usual `model-state-changed` event.
 4. On any error (server down, timeout, non-200, bad JSON) it logs a warning, loads the selected
-   local model if preload was skipped, and returns `None`, so Handy's normal local path runs.
+   local model (bypassing the load hook) if none is loaded, and returns `None`, so Handy's normal
+   local path runs. The first fallback dictation pays the model load.
    Dictation never fails because the server is down.
 
 Not covered: live preview (streaming models) has no local engine to stream with while remote is
-on, so it falls back to batch, which goes to the server. Picking a model in the UI still loads it
-locally (`commands/models.rs`). Recording still requires a downloaded local model, both because
+on, so it falls back to batch, which goes to the server. With `--transcribe-file`, `load=` and
+`backend=?` report the skipped load while the server is up. Recording still requires a downloaded local model, both because
 upstream checks for one before opening the mic and because the fallback needs it.
 
 ## Config
@@ -99,7 +106,7 @@ scripts/fork/rebase.sh v0.9.9
 It fetches `upstream` tags, rebases `rshlin/remote-whisper` onto the tag, prints the
 upstream-file diff (should still be the three lines above) and runs the module tests. On a
 conflict it lists the files and stops; re-apply the hook lines by hand (they only need
-`initiate_model_load()` and `transcribe()` to exist with those names and the early-return
+`load_model_with_device()` and `transcribe()` to exist with those names and the early-return
 semantics), then `git add` and `git rebase --continue`. Push with
 `git push --force-with-lease origin rshlin/remote-whisper`.
 
