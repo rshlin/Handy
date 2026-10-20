@@ -40,5 +40,6 @@ fi
 rm -rf "$DEST"
 ditto "$app" "$DEST"
 
-codesign -dv "$DEST" 2>&1 | grep -E '^(Identifier|Authority)='
+codesign -dv "$DEST" 2>&1 | grep -E '^(Identifier|Authority|TeamIdentifier)='
+codesign -d -r- "$DEST" 2>&1 | grep '^designated'
 echo "Installed $DEST $(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$DEST/Contents/Info.plist") ($(git rev-parse --short HEAD))"
